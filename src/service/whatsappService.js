@@ -1,101 +1,130 @@
-const makeWASocket = require("@whiskeysockets/baileys").default;
-const { DisconnectReason, useMultiFileAuthState } = require("@whiskeysockets/baileys");
-const { Boom } = require("@hapi/boom");
+const qrcode = require("qrcode");
+const { Client, LocalAuth } = require('whatsapp-web.js');
 const fs = require('fs');
 const path = require('path');
 const { sendMessageToGemini } = require("./geminiService");
-const qrcode = require("qrcode");
 
-const clients = {}; 
+const clients = new Map();
 
-async function createWhatsAppClient(userId) {
-    const sessionPath = path.join(__dirname, `../../baileys_auth_info/${userId}`);
-    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-    const sock = makeWASocket({
-        printQRInTerminal: true,
-        auth: state,
-        markOnlineOnConnect: false,
+async function createClient(sessionId) {
+    if (clients.has(sessionId)) {
+        console.log(`⚠ Session ${sessionId} already exists`);
+        return;
+    }
+
+    const client = new Client({
+        authStrategy: new LocalAuth({ dataPath: `whatsapp/${sessionId}` }),
+        puppeteer: {
+            headless: true,
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu'
+            ]
+        }
     });
 
-    sock.ev.on("creds.update", saveCreds);
+    client.on('ready', () => {
+        console.log(`✅ WhatsApp Client ${sessionId} is ready!`);
 
-    sock.ev.on("connection.update", async (update) => {
-        const { connection, lastDisconnect, qr } = update;
+        const qrPath = path.join(__dirname, `../../public/qrcodes/${sessionId}.png`);
+        
+        if (fs.existsSync(qrPath)) {
+            fs.unlink(qrPath, (err) => {
+                if (err) console.error(`❌ Failed to delete QR Code for ${sessionId}:`, err);
+                else console.log(`🗑️ Deleted QR Code for session ${sessionId}`);
+            });
+        }
+    });
 
-        if (qr) {
-            console.log("Scan this QR Code:", qr);
-
-            // Generate QR code image and store it
-            const qrPath = path.join(__dirname, `../../public/qrcodes/${userId}.png`);
+    client.on('qr', async (qr) => {
+        console.log('📌 QR Code received, saving as PNG...');
+        
+        try {
+            const qrPath = path.join(__dirname, `../../public/qrcodes/${sessionId}.png`);
             if (fs.existsSync(qrPath)) {
                 fs.unlinkSync(qrPath);
             }
         
-            // Generate QR Code baru
             await qrcode.toFile(qrPath, qr, { width: 300 });
-            clients[userId] = { sock, qrPath };
+            console.log('✅ QR Code saved as PNG.');
+        } catch (error) {
+            console.error('❌ Error saving QR Code:', error);
         }
+    });
 
-        if (connection === "close") {
-            const errorCode = lastDisconnect?.error?.output?.statusCode;
-            console.log("Connection closed due to:", lastDisconnect?.error);
-
-            if (errorCode === 401 || lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut) {
-                console.log("Logged out, clearing session and regenerating QR...");
-
-                // Delete auth folder to force new login
-                console.log(sessionPath)
-                fs.rmSync(sessionPath, { recursive: true, force: true });
-
-                // Reconnect and regenerate QR
-                createWhatsAppClient(userId);
-            } else {
-                const shouldReconnect = errorCode !== DisconnectReason.loggedOut;
-                if (shouldReconnect) {
-                    createWhatsAppClient(userId);
-                }
+    client.on('message_create', async (message) => {
+        try {
+            if (message.body === '!ping') {
+                await client.sendMessage(message.from, 'pong');
+            } else if (message.body === '!exit') {
+                console.log(`🔴 Exiting session: ${sessionName}`);
+                await client.logout();
+            } else if (message.body === '!restart') {
+                console.log(`♻ Restarting session: ${sessionName}`);
+                await restartClient(sessionName);
+            } else if (message.body.toLowerCase().split(" ")[0] == "!ask"){
+                const query = message.body.split(" ").slice(1).join(" ");
+                const response = await sendMessageToGemini(query);
+                await client.sendMessage(message.from, response);
             }
-        } else if (connection === "open") {
-            console.log("WhatsApp connection opened");
+        } catch (error) {
+            console.error(`❌ Error handling message in session ${sessionName}:`, error);
         }
     });
 
-    sock.ev.on("messages.upsert", async (m) => {
-        const message = m.messages[0]; 
-        const remoteJid = message.key.remoteJid;
-        const text = message.message?.conversation || message.message?.extendedTextMessage?.text;
-        console.log(sessionPath)
-        if (remoteJid && text?.toLowerCase() === "!ping") {
-            await sock.sendMessage(remoteJid, { text: "pong" });
-            console.log(`Replied with "pong" to ${remoteJid}`);
-        }
-        if(remoteJid && text?.toLowerCase().split(" ")[0] === "!ask"){
-            const query = text.split(" ").slice(1).join(" ");
-            const response = await sendMessageToGemini(query);
+    client.on('disconnected', reason => {
+        restartClient(reason)
+    });
 
-            await sock.sendMessage(remoteJid, { text: response });
+    client.on('change_state', state => {
+        console.log(`📢 Client ${sessionName} state changed: ${state}`);
+        if (state === 'CONFLICT' || state === 'UNLAUNCHED') {
+            restartClient(sessionName);
         }
     });
 
-    clients[userId] = sock;
+    client.on('auth_failure', message => {
+        console.error(`❌ Authentication failure for session ${sessionName}:`, message);
+        restartClient(sessionName);
+    });
+
+    client.initialize();
+
+    clients.set(sessionId, client);
 }
 
-async function getClient(userId) {
-    console.log("test" + userId)
-    if (clients[userId]) {
-        console.log(`Client for ${userId} already exists.`);
-        return clients[userId];
+async function  restartClient(sessionId) {
+    if(!sessionId){
+        return "Session Id is required";
     }
 
-    return createWhatsAppClient(userId);
-}
-
-async function sendMessage(userId, jid, message) {
-    if (!clients[userId]) {
-        throw new Error(`WhatsApp session for ${userId} is not connected`);
+    console.log(`♻ Restarting client...`);
+    if (clients[sessionId]) {
+        await clients[sessionId].logout();
+        clients[sessionId] = null;
     }
-    await clients[userId].sendMessage(jid, { text: message });
+    setTimeout(() => {
+        console.log("🔄 Reinitializing WhatsApp client...");
+        createClient();
+    }, 5000);
 }
 
+async function sendMessage(session, number, message) {
+    if (!clients.has(session)) {
+        console.error(`❌ Session ${session} does not exist.`);
+        throw new Error(`Session ${session} does not exist.`);
+    }
 
-module.exports = { getClient, sendMessage };
+    const client = clients.get(session);
+    try {
+        await client.sendMessage(number, message);
+        console.log(`📩 Message sent to ${number} from session ${session}`);
+    } catch (error) {
+        console.error(`❌ Failed to send message:`, error);
+    }
+}
+
+module.exports = {createClient, restartClient, sendMessage};
